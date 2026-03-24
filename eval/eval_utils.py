@@ -83,6 +83,10 @@ TASK_REGISTRY: dict[str, TaskConfig] = {
         episode_steps=60,
         extra_wrappers=[(RememberColorInfoWrapper, {})],
     ),
+    "RememberShape3-v0": TaskConfig(
+        episode_steps=60,
+        extra_wrappers=[(RememberShapeInfoWrapper, {})],
+    ),
 }
 
 
