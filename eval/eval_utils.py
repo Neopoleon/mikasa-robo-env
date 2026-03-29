@@ -1,7 +1,7 @@
 """shared utilities for MIKASA-Robo evaluation and replay.
 
 obs:    2 rgb cameras (third-person + wrist, 256x256) + 8d proprio (7 arm qpos + 1 gripper).
-action: 8d joint-space deltas (7 arm pd_joint_delta_pos + 1 gripper).
+action: 8d joint-space — deltas (pd_joint_delta_pos), absolute qpos (pd_joint_pos), or teleport (direct-qpos).
 policy: diffusion transformer (SigLIP2 + memory transformer), predicts action chunks.
 """
 
@@ -131,14 +131,16 @@ def make_eval_env(
     output_dir: str,
     seed: int,
     reward_mode: str,
+    control_mode: str = "pd_joint_delta_pos",
 ) -> tuple[ManiSkillVectorEnv, gym.Env]:
     """create gpu-vectorized env with wrapper stack.
     returns (vec_env, inner_env) — inner_env.render() has wrapper overlays,
     vec_env.render() bypasses them.
+    control_mode: 'pd_joint_delta_pos' (default) or 'pd_joint_pos' (absolute target qpos).
     """
     env_kwargs = dict(
         obs_mode="rgb",
-        control_mode="pd_joint_delta_pos",
+        control_mode=control_mode,
         render_mode="all" if capture_video else "rgb_array",
         sim_backend="gpu",
         reward_mode=reward_mode,
@@ -199,9 +201,78 @@ def obs_to_policy_input(
     return result
 
 
+# direct qpos teleportation (perfect controller mode)
+
+def teleport_and_step(env, predicted_8d: torch.Tensor):
+    """teleport robot to predicted absolute joint positions and advance the env by one step.
+    NO physics simulation — perfect controller assumption means we just set qpos directly.
+
+    we monkey-patch scene.step to a no-op during env.step(None) so that:
+    - gravity doesn't pull objects hidden at z=1000 during memory phases
+    - the full wrapper chain (FlattenRGBD, task wrappers, etc.) still processes obs normally
+    - evaluate() still runs to handle shape visibility / reward / termination
+
+    predicted_8d: (B, 8) — 7 arm qpos + 1 gripper qpos.
+    panda has 9 DOF (7 arm + 2 gripper fingers), so we mirror the single gripper value.
+
+    returns: (obs, reward, terminated, truncated, info) — same as env.step().
+    """
+    base_env = env.unwrapped
+    robot = base_env.agent.robot
+
+    # build full 9-dof qpos from predicted 8d
+    qpos = robot.get_qpos()                            # (B, 9)
+    qpos[:, :7] = predicted_8d[:, :7]                   # arm joints
+    qpos[:, 7:9] = predicted_8d[:, 7:8].expand(-1, 2)   # mirror gripper to both fingers
+
+    # teleport: set qpos + zero velocity, sync GPU
+    robot.set_qpos(qpos)
+    robot.set_qvel(torch.zeros_like(qpos))
+    base_env.scene._gpu_apply_all()
+    base_env.scene.px.gpu_update_articulation_kinematics()
+    base_env.scene._gpu_fetch_all()
+
+    # fix shape visibility: evaluate() captures original_poses from current cube/shape
+    # positions at the TOP of evaluate(). during the hiding phase shapes are at z=1000,
+    # so original_poses gets z=1000 too. when the reappear phase triggers, evaluate()
+    # restores from original_poses — which is still z=1000. with real physics the shapes
+    # would fall back, but we disabled physics. fix: before evaluate() runs, reset all
+    # shapes/cubes to their initial_poses (table-level z) so original_poses is correct.
+    initial_poses = getattr(base_env, 'initial_poses', None)
+    if initial_poses is not None:
+        # remember_color uses self.cubes, remember_shape uses self.shapes
+        for actor_dict in [getattr(base_env, 'cubes', {}), getattr(base_env, 'shapes', {})]:
+            for key in initial_poses:
+                if key in actor_dict:
+                    pose = actor_dict[key].pose.raw_pose.clone()
+                    pose[:, :3] = initial_poses[key]
+                    actor_dict[key].pose = pose
+        base_env.scene._gpu_apply_all()
+        base_env.scene._gpu_fetch_all()
+
+    # disable physics sim but keep GPU sync: replace scene.step with apply+fetch
+    # so that pose changes from evaluate() are visible to get_obs() camera rendering,
+    # but no forces/gravity pull objects from their correct positions.
+    scene = base_env.scene
+    original_step = scene.step
+
+    def _sync_only():
+        scene._gpu_apply_all()
+        scene.px.gpu_update_articulation_kinematics()
+        scene._gpu_fetch_all()
+
+    scene.step = _sync_only
+    try:
+        result = env.step(None)
+    finally:
+        scene.step = original_step
+
+    return result
+
+
 # inference
 
-ACTION_HORIZON = 1  # actions per prediction, matches training chunk size
+ACTION_HORIZON = 2  # actions per prediction, matches training chunk size
 
 
 @torch.no_grad()
@@ -213,12 +284,15 @@ def predict_action(
     device: torch.device,
     no_proprio: bool = False,
 ) -> torch.Tensor:
-    """obs → normalize → diffusion denoise → unnormalize → action chunk (B, ACTION_HORIZON, 8)."""
+    """obs → normalize → diffusion denoise → unnormalize → action chunk (B, ACTION_HORIZON, 8).
+    auto-detects output key: action0_8d (action-space) or robot0_8d (state-space / direct-qpos).
+    """
     batch = obs_to_policy_input(obs, num_envs, device, no_proprio=no_proprio)
     batch = normalizer.normalize(batch)
     action_dict = policy.predict_action(batch)
     action_dict = normalizer.unnormalize(action_dict)
-    return action_dict["action0_8d"][:, :ACTION_HORIZON, :]
+    output_key = "action0_8d" if "action0_8d" in action_dict else "robot0_8d"
+    return action_dict[output_key][:, :ACTION_HORIZON, :]
 
 
 # frame annotation helpers
@@ -302,10 +376,10 @@ def _annotate_replay_render_frames(frames, expert_actions, policy_actions):
 def _save_video_and_frames(episode_dir, name, frames, fps):
     """save video and individual pngs under episode_dir/{name}."""
     imageio.mimsave(os.path.join(episode_dir, f"video_{name}.mp4"), frames, fps=fps)
-    frames_dir = os.path.join(episode_dir, f"frames_{name}")
-    os.makedirs(frames_dir, exist_ok=True)
-    for i, frame in enumerate(frames):
-        imageio.imwrite(os.path.join(frames_dir, f"frame_{i:03d}.png"), frame)
+    # frames_dir = os.path.join(episode_dir, f"frames_{name}")
+    # os.makedirs(frames_dir, exist_ok=True)
+    # for i, frame in enumerate(frames):
+    #     imageio.imwrite(os.path.join(frames_dir, f"frame_{i:03d}.png"), frame)
 
 
 # episode recording
@@ -416,6 +490,7 @@ def handle_episode_completions(
     num_episodes: int,
     task_dir: str,
     metrics: dict[str, list],
+    env=None,
 ) -> int:
     """save completed episodes to disk. returns updated episode count.
     ManiSkillVectorEnv sets infos["_final_info"] (B,) bool mask and
@@ -438,6 +513,10 @@ def handle_episode_completions(
         success = ep_metrics.get("success_once", 0.0) > 0.5
         tag = "success" if success else "failure"
         ep_metrics["episode_idx"] = num_episodes
+        if env is not None:
+            seeds = getattr(env.unwrapped, '_episode_seed', None)
+            if seeds is not None:
+                ep_metrics["env_seed"] = int(seeds[i])
 
         rgb_frames, joints_frames, actions, rewards, render_frames = buffers.flush(i)
         save_episode(

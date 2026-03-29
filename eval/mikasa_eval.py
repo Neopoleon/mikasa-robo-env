@@ -1,10 +1,19 @@
 """evaluate imitation learning policies on MIKASA-Robo environments.
 
 modes:
-  eval:   python mikasa_eval.py --env-id ShellGameTouch-v0 --checkpoint path/to/ckpt --num-envs 16
-  replay: python mikasa_eval.py --env-id RememberColor3-v0 --checkpoint path/to/ckpt \
-              --replay-data path/to/episode_data.zarr --replay-episodes 0 1 5
-          feeds expert obs to policy, overlays expert (green) vs policy (red) actions for debugging.
+  eval:          python mikasa_eval.py --env-id ShellGameTouch-v0 --checkpoint path/to/ckpt --num-envs 16
+                 normal eval with pd_joint_delta_pos controller.
+  abs-joint-pos: python mikasa_eval.py --env-id RememberColor3-v0 --checkpoint path/to/ckpt \
+                     --abs-joint-pos --num-envs 16
+                 policy predicts absolute target qpos, executed via pd_joint_pos PD controller.
+  direct-qpos:   python mikasa_eval.py --env-id RememberShape3-v0 --checkpoint path/to/ckpt \
+                     --direct-qpos --num-envs 16
+                 policy predicts absolute joint positions, robot is teleported (no physics).
+  replay:        python mikasa_eval.py --env-id RememberColor3-v0 --checkpoint path/to/ckpt \
+                     --replay-data path/to/episode_data.zarr --replay-episodes 0 1 5
+                 feeds expert obs to policy, overlays expert (green) vs policy (red) actions.
+
+any mode can be combined with --train-seeds-only to eval on exact training seeds.
 """
 
 import argparse
@@ -23,6 +32,7 @@ from eval_utils import (
     load_policy,
     make_eval_env,
     predict_action,
+    teleport_and_step,
     EpisodeBuffers,
     handle_episode_completions,
     _divergence_stats,
@@ -68,7 +78,7 @@ def run_eval(env, inner_env, policy, normalizer, num_envs, num_eval_steps, devic
 
             if "final_info" in infos:
                 num_episodes = handle_episode_completions(
-                    infos, buffers, num_envs, num_episodes, task_dir, metrics,
+                    infos, buffers, num_envs, num_episodes, task_dir, metrics, env=env,
                 )
                 completed |= infos["_final_info"].cpu().numpy()
                 if completed.all():
@@ -83,6 +93,128 @@ def run_eval(env, inner_env, policy, normalizer, num_envs, num_eval_steps, devic
 
     results = {"num_episodes": num_episodes}
     for k, v in metrics.items():
+        results[k] = torch.stack(v).float().mean().item()
+
+    with open(os.path.join(task_dir, "summary.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"saved {num_episodes} episodes to {task_dir}/")
+
+    return results
+
+
+# direct-qpos mode — policy predicts absolute joint positions, robot is teleported there.
+# bare minimum test: if the policy can't predict the next state, action-based control won't work either.
+
+def run_direct_qpos(env, inner_env, policy, normalizer, num_envs, num_eval_steps, device, seed,
+                    output_dir, env_id, no_proprio=False):
+    """policy predicts absolute qpos → teleport robot → get obs → repeat.
+    same as run_eval but replaces env.step(action) with teleport_to_qpos(predicted_state).
+    """
+    task_dir = os.path.join(output_dir, env_id)
+    os.makedirs(task_dir, exist_ok=True)
+
+    obs, _ = env.reset(seed=seed)
+    buffers = EpisodeBuffers(num_envs)
+    metrics = defaultdict(list)
+    num_episodes = 0
+    completed = np.zeros(num_envs, dtype=bool)
+    step = 0
+    pbar = tqdm(total=num_eval_steps, desc="direct-qpos eval")
+
+    while step < num_eval_steps:
+        action_chunk = predict_action(obs, policy, normalizer, num_envs, device, no_proprio=no_proprio)
+
+        for t in range(ACTION_HORIZON):
+            if step >= num_eval_steps:
+                break
+
+            render_frame = inner_env.render()
+            buffers.append_obs(obs, render_frame=render_frame)
+            predicted_qpos = action_chunk[:, t, :]  # (B, 8) — absolute joint positions
+            buffers.append_action(predicted_qpos)
+
+            # teleport robot and advance env (bypasses PD controller entirely)
+            obs, reward, _term, _trunc, infos = teleport_and_step(env, predicted_qpos)
+            buffers.append_reward(reward)
+            step += 1
+            pbar.update(1)
+
+            if "final_info" in infos:
+                num_episodes = handle_episode_completions(
+                    infos, buffers, num_envs, num_episodes, task_dir, metrics, env=env,
+                )
+                completed |= infos["_final_info"].cpu().numpy()
+                if completed.all():
+                    policy.reset()
+                    completed[:] = False
+                    break
+
+    pbar.close()
+
+    results = {"num_episodes": num_episodes}
+    for k, v in metrics.items():
+        results[k] = torch.stack(v).float().mean().item()
+
+    with open(os.path.join(task_dir, "summary.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"saved {num_episodes} episodes to {task_dir}/")
+
+    return results
+
+
+# train-seeds-only mode — loop through exact training seeds in parallel batches.
+# ensures each eval episode uses the exact same scene as training.
+
+def run_with_train_seeds(env, inner_env, policy, normalizer, device, train_seeds, task_cfg,
+                         num_envs, output_dir, env_id, no_proprio=False, direct_qpos=False):
+    """run eval/direct-qpos on training seeds in batches of num_envs.
+    each episode gets a unique seed from train_seeds. resets all envs per batch.
+    """
+    task_dir = os.path.join(output_dir, env_id)
+    os.makedirs(task_dir, exist_ok=True)
+    episode_steps = task_cfg.episode_steps
+    mode = "direct-qpos" if direct_qpos else "eval"
+
+    # pad seed list so it divides evenly into batches of num_envs
+    remainder = len(train_seeds) % num_envs
+    if remainder:
+        train_seeds = train_seeds + train_seeds[:num_envs - remainder]
+    num_batches = len(train_seeds) // num_envs
+
+    print(f"\ntrain-seeds-only {mode}: {env_id} | {len(train_seeds)} seeds | "
+          f"{episode_steps} steps/ep | {num_envs} envs | {num_batches} batches")
+
+    all_metrics = defaultdict(list)
+    num_episodes = 0
+
+    # process seeds in batches of num_envs
+    for batch_start in tqdm(range(0, len(train_seeds), num_envs), desc=f"train-seeds {mode}"):
+        batch_seeds = train_seeds[batch_start:batch_start + num_envs]
+        policy.reset()
+        obs, _ = env.reset(seed=batch_seeds)
+        buffers = EpisodeBuffers(num_envs)
+
+        for step in range(episode_steps):
+            action_chunk = predict_action(obs, policy, normalizer, num_envs, device, no_proprio=no_proprio)
+            action = action_chunk[:, 0, :]
+
+            render_frame = inner_env.render()
+            buffers.append_obs(obs, render_frame=render_frame)
+            buffers.append_action(action)
+
+            if direct_qpos:
+                obs, reward, _term, _trunc, infos = teleport_and_step(env, action)
+            else:
+                obs, reward, _term, _trunc, infos = env.step(action)
+            buffers.append_reward(reward)
+
+            if "final_info" in infos:
+                num_episodes = handle_episode_completions(
+                    infos, buffers, num_envs, num_episodes, task_dir, all_metrics, env=env,
+                )
+
+    results = {"num_episodes": num_episodes}
+    for k, v in all_metrics.items():
         results[k] = torch.stack(v).float().mean().item()
 
     with open(os.path.join(task_dir, "summary.json"), "w") as f:
@@ -217,6 +349,15 @@ def parse_args():
                         help="which episode indices to replay (default: all)")
     parser.add_argument("--no-proprio", action="store_true",
                         help="vision-only policy: omit robot0_8d from policy input")
+    parser.add_argument("--abs-joint-pos", action="store_true",
+                        help="policy predicts absolute target qpos; executed via pd_joint_pos "
+                             "PD controller (real physics, unlike --direct-qpos)")
+    parser.add_argument("--direct-qpos", action="store_true",
+                        help="policy predicts absolute joint positions; robot is teleported "
+                             "to predicted qpos each step (perfect controller, no physics)")
+    parser.add_argument("--train-seeds-only", type=str, default=None,
+                        help="path to training seeds JSON file (e.g. seeds/train_seeds.json). "
+                             "eval on exact training seeds in batches of --num-envs.")
     return parser.parse_args()
 
 
@@ -226,8 +367,18 @@ def main():
     task_cfg = TASK_REGISTRY[args.env_id]
     policy, normalizer = load_policy(args.checkpoint, device)
 
+    if args.abs_joint_pos and args.direct_qpos:
+        raise ValueError("--abs-joint-pos and --direct-qpos are mutually exclusive")
+
+    # load training seeds if requested
+    train_seeds = None
+    if args.train_seeds_only:
+        with open(args.train_seeds_only) as f:
+            train_seeds = json.load(f)
+        print(f"\ntrain-seeds-only mode: loaded {len(train_seeds)} seeds from {args.train_seeds_only}")
+
+    # replay mode: no env needed
     if args.replay_data:
-        # replay mode: no env needed, feed expert obs from zarr to policy offline
         print(f"\nreplay mode: {args.env_id} | expert data: {args.replay_data}")
         run_replay(
             policy, normalizer, device,
@@ -236,27 +387,56 @@ def main():
             output_dir=args.output_dir, env_id=args.env_id,
             no_proprio=args.no_proprio,
         )
+        return
+
+    # determine control mode
+    if args.abs_joint_pos:
+        control_mode = "pd_joint_pos"
+        mode_label = "abs-joint-pos"
+    elif args.direct_qpos:
+        control_mode = "pd_joint_delta_pos"  # doesn't matter — teleport bypasses controller
+        mode_label = "direct-qpos"
     else:
-        # normal eval mode
-        num_eval_steps = args.num_eval_steps or task_cfg.episode_steps
-        env, inner_env = make_eval_env(
-            env_id=args.env_id, task_cfg=task_cfg, num_envs=args.num_envs,
-            num_eval_steps=num_eval_steps, capture_video=args.capture_video,
-            output_dir=args.output_dir, seed=args.seed, reward_mode=args.reward_mode,
+        control_mode = "pd_joint_delta_pos"
+        mode_label = "eval"
+
+    num_eval_steps = args.num_eval_steps or task_cfg.episode_steps
+    env, inner_env = make_eval_env(
+        env_id=args.env_id, task_cfg=task_cfg, num_envs=args.num_envs,
+        num_eval_steps=num_eval_steps, capture_video=args.capture_video,
+        output_dir=args.output_dir, seed=args.seed, reward_mode=args.reward_mode,
+        control_mode=control_mode,
+    )
+
+    if train_seeds is not None:
+        results = run_with_train_seeds(
+            env, inner_env, policy, normalizer, device, train_seeds, task_cfg,
+            num_envs=args.num_envs, output_dir=args.output_dir, env_id=args.env_id,
+            no_proprio=args.no_proprio, direct_qpos=args.direct_qpos,
         )
-        print(f"\nevaluating {args.env_id} | {num_eval_steps} steps | {args.num_envs} envs")
+    elif args.direct_qpos:
+        print(f"\n{mode_label}: {args.env_id} | {num_eval_steps} steps | {args.num_envs} envs")
+        results = run_direct_qpos(
+            env, inner_env, policy, normalizer, args.num_envs, num_eval_steps, device, args.seed,
+            output_dir=args.output_dir, env_id=args.env_id, no_proprio=args.no_proprio,
+        )
+    else:
+        # normal eval and abs-joint-pos use the same loop — only control_mode differs
+        print(f"\n{mode_label}: {args.env_id} | {num_eval_steps} steps | {args.num_envs} envs")
         results = run_eval(
             env, inner_env, policy, normalizer, args.num_envs, num_eval_steps, device, args.seed,
             output_dir=args.output_dir, env_id=args.env_id, no_proprio=args.no_proprio,
         )
-        env.close()
 
-        print(f"\n{'='*50}")
-        n = int(results.pop("num_episodes"))
-        print(f"completed {n} episodes in {num_eval_steps} steps ({num_eval_steps * args.num_envs} env transitions across {args.num_envs} envs)")
-        for k, v in results.items():
-            print(f"  {k}: {v:.4f}")
-        print(f"{'='*50}")
+    env.close()
+
+    print(f"\n{'='*50}")
+    n = int(results.pop("num_episodes"))
+    print(f"{mode_label}: {n} episodes in {num_eval_steps} steps "
+          f"({num_eval_steps * args.num_envs} transitions across {args.num_envs} envs)")
+    for k, v in results.items():
+        print(f"  {k}: {v:.4f}")
+    print(f"{'='*50}")
 
 
 if __name__ == "__main__":
