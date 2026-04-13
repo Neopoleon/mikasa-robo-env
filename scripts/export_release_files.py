@@ -24,6 +24,8 @@ def export_release_files(output_root_dir: str):
     # Files to exclude from export (relative paths)
     exclude_files = {
         "scripts/export_release_files.py",
+        "setup.py",
+        "requirements.txt",
     }
 
     # Directories to exclude from export
