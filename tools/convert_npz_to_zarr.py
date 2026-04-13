@@ -86,7 +86,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", type=str, default="data/MIKASA-Robo/unbatched",
                         help="Directory containing task subdirs with NPZ files")
-    parser.add_argument("--output-dir", type=str, default="/home/jeff/imitation-learning-policies/mikasa_data",
+    parser.add_argument("--output-dir", type=str, required=True,
                         help="Output directory for zarr stores")
     parser.add_argument("--tasks", nargs="+",
                         default=["RememberColor3-v0", "InterceptMedium-v0", "ShellGameTouch-v0"],

@@ -1,17 +1,16 @@
-"""MIKASA remote evaluation server.
+"""MIKASA remote evaluation server for distributed eval.
 
-Runs in its own conda env (with gymnasium / ManiSkill).  Connects to the
+Runs in its own conda env (with gymnasium / ManiSkill). Connects to the
 policy server via robotmq, waits for checkpoint-loaded signals, evaluates
 each checkpoint, and posts results back.
 
     Terminal 1 (imitation):  python scripts/run_remote_policy_server.py
-    Terminal 2 (mikasa):     CUDA_VISIBLE_DEVICES=1 python eval/mikasa_env_server.py
+    Terminal 2 (mikasa):     bash shell_scripts/serve_mikasa_env.sh [GPU_ID] [PORT]
     Terminal 3 (imitation):  python scripts/run_mikasa_eval.py
 """
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -27,8 +26,8 @@ from loguru import logger
 logger.remove()
 logger.add(sys.stderr, format="<cyan>{time:HH:mm:ss}</cyan> {message}")
 
-from eval_utils import TASK_REGISTRY, make_eval_env
-from mikasa_eval import run_eval, run_direct_qpos, run_with_train_seeds
+from tasks import TASK_REGISTRY, make_eval_env, resolve_control_mode, compute_eval_steps
+from mikasa_eval import run_eval, run_direct_qpos
 from remote_policy_client import RemotePolicyClient
 
 _CFG_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".eval_config_cache.json")
@@ -42,11 +41,12 @@ _METRIC_RENAME = {
 }
 
 
-# -- EvalConfig ---------------------------------------------------------------
+# Eval config
 
 @dataclass
 class EvalConfig:
     """Per-checkpoint eval parameters (received from orchestrator via robotmq)."""
+
     num_envs: int = 16
     num_eval_steps: int | None = None
     num_eval_episodes: int | None = 100
@@ -54,14 +54,13 @@ class EvalConfig:
     seed: int = 0
     abs_joint_pos: bool = False
     direct_qpos: bool = False
-    train_seeds_only: str | None = None
     reward_mode: str = "normalized_dense"
     output_dir: str | None = None
     ckpt_path: str | None = None
     epoch: int | None = None
     run_name: str | None = None
 
-    _field_names: set = None
+    _field_names: set | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "EvalConfig":
@@ -83,7 +82,7 @@ class EvalConfig:
             return cls.from_dict(json.load(f))
 
 
-# -- helpers -------------------------------------------------------------------
+# Robotmq helpers
 
 def _policy_ready(endpoint: str) -> bool:
     """Probe the policy server — True if a checkpoint is currently loaded."""
@@ -97,7 +96,7 @@ def _policy_ready(endpoint: str) -> bool:
 
 
 def _wait_for_policy(endpoint: str, timeout: int = 30) -> None:
-    """Block until the policy server has a checkpoint loaded. Raises ConnectionError."""
+    """Block until the policy server has a checkpoint loaded."""
     for _ in range(timeout):
         if _policy_ready(endpoint):
             return
@@ -106,7 +105,7 @@ def _wait_for_policy(endpoint: str, timeout: int = 30) -> None:
 
 
 def _wait_for_topic(client: robotmq.RMQClient, topic: str) -> None:
-    """Block until *topic* has data, then pop it. Raises ConnectionError on disconnect."""
+    """Block until topic has data, then pop it."""
     while True:
         status = client.get_topic_status(topic, timeout_s=1)
         if status == -2:
@@ -115,22 +114,6 @@ def _wait_for_topic(client: robotmq.RMQClient, topic: str) -> None:
             break
         time.sleep(1)
     client.pop_data(topic, n=1)
-
-
-def _resolve_control(cfg: EvalConfig) -> tuple[str, str]:
-    if cfg.abs_joint_pos:
-        return "pd_joint_pos", "abs-joint-pos"
-    if cfg.direct_qpos:
-        return "pd_joint_delta_pos", "direct-qpos"
-    return "pd_joint_delta_pos", "eval"
-
-
-def _compute_eval_steps(cfg: EvalConfig, episode_steps: int) -> int:
-    if cfg.num_eval_steps is not None:
-        return cfg.num_eval_steps
-    if cfg.num_eval_episodes is not None:
-        return math.ceil(cfg.num_eval_episodes / cfg.num_envs) * episode_steps
-    return episode_steps
 
 
 def _get_eval_config(client: robotmq.RMQClient) -> EvalConfig:
@@ -160,14 +143,14 @@ def _build_task_dir(output_dir: str, env_id: str, cfg: EvalConfig) -> str:
     return os.path.join(output_dir, env_id, ckpt_str)
 
 
-# -- main loop -----------------------------------------------------------------
+# Main loop
 
 _log_file_dir: str | None = None
 _log_file_id: int | None = None
 
 
 def _ensure_log_file(output_dir: str) -> None:
-    """Point the file log sink at *output_dir* (re-adds only when dir changes)."""
+    """Point the file log sink at output_dir (re-adds only when dir changes)."""
     global _log_file_dir, _log_file_id
     if _log_file_dir == output_dir:
         return
@@ -184,47 +167,49 @@ def run_server(policy_server_address: str, default_output_dir: str) -> None:
     client = robotmq.RMQClient("mikasa_env_server", policy_server_address)
     logger.info(f"connected to {policy_server_address}")
 
-    # on startup only: if the policy server already has a checkpoint loaded
-    # (we were killed mid-eval), resume immediately without waiting for a signal
+    # If the policy server already has a checkpoint (we were killed mid-eval), resume
     resumed = False
     if _policy_ready(policy_server_address):
         logger.info("resuming — policy server already has checkpoint loaded")
         resumed = True
 
-    while True:
-        if not resumed:
-            logger.info("waiting for checkpoint...")
+    try:
+        while True:
+            if not resumed:
+                logger.info("waiting for checkpoint...")
+                try:
+                    _wait_for_topic(client, "new_checkpoint_loaded")
+                except ConnectionError:
+                    logger.warning("policy server gone, retrying in 5s...")
+                    time.sleep(5)
+                    continue
+            resumed = False
+
+            cfg = _get_eval_config(client)
+            output_dir = cfg.output_dir or default_output_dir
+            os.makedirs(output_dir, exist_ok=True)
+            _ensure_log_file(output_dir)
+
             try:
-                _wait_for_topic(client, "new_checkpoint_loaded")
+                _eval_one_checkpoint(policy_server_address, output_dir, cfg)
             except ConnectionError:
-                logger.warning("policy server gone, retrying in 5s...")
-                time.sleep(5)
-                continue
-        resumed = False
-
-        cfg = _get_eval_config(client)
-        output_dir = cfg.output_dir or default_output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        _ensure_log_file(output_dir)
-
-        try:
-            _eval_one_checkpoint(policy_server_address, output_dir, cfg)
-        except ConnectionError:
-            logger.error("policy server disconnected during eval")
-        except Exception:
-            traceback.print_exc()
-            try:
-                p = RemotePolicyClient(policy_server_address)
-                p.report_results({"error": True})
-                p.cleanup()
+                logger.error("policy server disconnected during eval")
             except Exception:
-                pass
+                traceback.print_exc()
+                try:
+                    p = RemotePolicyClient(policy_server_address)
+                    p.report_results({"error": True})
+                    p.cleanup()
+                except Exception:
+                    pass
+    except KeyboardInterrupt:
+        logger.info("interrupted, shutting down")
 
 
-# -- evaluation ----------------------------------------------------------------
+# Per-checkpoint evaluation
 
 def _eval_one_checkpoint(
-    policy_server_address: str, output_dir: str, cfg: EvalConfig
+    policy_server_address: str, output_dir: str, cfg: EvalConfig,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _wait_for_policy(policy_server_address)
@@ -232,8 +217,10 @@ def _eval_one_checkpoint(
 
     env_id = policy.env_id
     task_cfg = TASK_REGISTRY[env_id]
-    control_mode, mode_label = _resolve_control(cfg)
-    num_eval_steps = _compute_eval_steps(cfg, task_cfg.episode_steps)
+    control_mode, mode_label = resolve_control_mode(cfg.abs_joint_pos, cfg.direct_qpos)
+    num_eval_steps = compute_eval_steps(
+        cfg.num_eval_steps, cfg.num_eval_episodes, cfg.num_envs, task_cfg.episode_steps,
+    )
     task_dir = _build_task_dir(output_dir, env_id, cfg)
 
     logger.info(f"{mode_label}: {env_id} | {num_eval_steps} steps | {cfg.num_envs} envs | {task_dir}")
@@ -246,37 +233,22 @@ def _eval_one_checkpoint(
     )
 
     try:
-        train_seeds = None
-        if cfg.train_seeds_only:
-            with open(cfg.train_seeds_only) as f:
-                train_seeds = json.load(f)
-
-        common = dict(
-            no_proprio=policy.no_proprio,
-            action_horizon=policy.action_horizon,
-        )
-
-        if train_seeds is not None:
-            results = run_with_train_seeds(
-                env, inner_env, policy, None, device, train_seeds, task_cfg,
-                num_envs=cfg.num_envs, output_dir=output_dir, env_id=env_id,
-                direct_qpos=cfg.direct_qpos, task_dir=task_dir, **common,
-            )
-        elif cfg.direct_qpos:
+        if cfg.direct_qpos:
             results = run_direct_qpos(
-                env, inner_env, policy, None, cfg.num_envs, num_eval_steps,
+                env, inner_env, policy, cfg.num_envs, num_eval_steps,
                 device, cfg.seed, output_dir=output_dir, env_id=env_id,
-                task_dir=task_dir, **common,
+                task_dir=task_dir,
             )
         else:
             results = run_eval(
-                env, inner_env, policy, None, cfg.num_envs, num_eval_steps,
+                env, inner_env, policy, cfg.num_envs, num_eval_steps,
                 device, cfg.seed, output_dir=output_dir, env_id=env_id,
-                task_dir=task_dir, **common,
+                task_dir=task_dir,
             )
     finally:
         env.close()
 
+    # Rename metrics for orchestrator compatibility
     n = int(results.pop("num_episodes"))
     results = {_METRIC_RENAME.get(k, k): v for k, v in results.items()}
 

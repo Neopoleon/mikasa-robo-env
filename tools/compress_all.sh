@@ -1,7 +1,9 @@
 #!/bin/bash
+# Compress all task zarr directories to .tar.lz4 in parallel.
+# Usage: bash tools/compress_all.sh /path/to/zarr_dir
 set -e
 
-DIR="/storage/ssd1/jeff/mikasa_zarr_processed"
+DIR="${1:?Usage: compress_all.sh <zarr_root_dir>}"
 
 pids=()
 for task_dir in "$DIR"/*/; do

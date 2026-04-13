@@ -1,121 +1,84 @@
 #!/bin/bash
+# Fetch a training checkpoint from a remote machine and run local eval.
+#
+# Usage: bash fetch_and_eval.sh
+#
+# Configure the variables below before running. The script will:
+#   1. rsync the checkpoint directory from the remote training machine
+#   2. select a checkpoint (hardcoded or latest epoch)
+#   3. run eval/mikasa_eval.py with the specified settings
 set -euo pipefail
 
-REMOTE="jeff@yihuaidesktop001"
-REMOTE_PREFIX="/data/yihuai/data/imitation-learning-policies/data"
+# Remote training machine
+REMOTE="user@hostname"
+REMOTE_PREFIX="/path/to/training/data"
 LOCAL_PREFIX="mikasa_models"
 
-# run path (no leading/trailing slash)
-RUN_PATH="mikasa_remember_color_3/2026-03-26/04-36-22_remember_color_3_diffusion_memory_lr3e-4_state_only_mem_2step"
-# RUN_PATH="mikasa_remember_color_3/2026-03-24/23-35-14_remember_color_3_diffusion_memory_lr3e-4_state_only_mem_2step_no_aug_1500episodes"
-# RUN_PATH="mikasa_remember_color_3/2026-03-24/23-35-14_remember_color_3_diffusion_memory_lr3e-4_state_only_mem_2step_no_aug_1500episodes"
-# RUN_PATH="mikasa_remember_shape_3/2026-03-24/18-04-43_remember_shape_3_diffusion_memory_lr3e-4_state_only_mem_1step"
-# RUN_PATH="mikasa_remember_color_3/2026-03-24/18-07-41_remember_color_3_diffusion_memory_lr3e-4_state_only_mem_1step"
+# Run to evaluate. Relative path under REMOTE_PREFIX.
+# Task name is auto-derived from the first component
+# (e.g. mikasa_remember_color_3 -> RememberColor3-v0).
+RUN_PATH="mikasa_remember_color_3/2026-03-26/04-36-22_run_name"
 
-# env id — auto-derived from RUN_PATH folder name
-# mikasa_remember_shape_3 -> RememberShape3-v0, mikasa_remember_color_3 -> RememberColor3-v0, etc.
-TASK_FOLDER=$(echo "${RUN_PATH}" | cut -d/ -f1)  # e.g. mikasa_remember_shape_3
-TASK_NAME=$(echo "${TASK_FOLDER}" | sed 's/^mikasa_//' \
-    | sed -E 's/_([a-z])/\U\1/g' \
-    | sed -E 's/_([0-9])/\1/g' \
-    | sed -E 's/^([a-z])/\U\1/')  # remember_shape_3 -> RememberShape3
-ENV_ID="${TASK_NAME}-v0"
-
-# eval settings
+# Eval settings
 NUM_ENVS=16
 NUM_EVAL_STEPS=420
 SEED=1000
-# DIRECT_QPOS=""
-DIRECT_QPOS="--direct-qpos"  # uncomment for direct-qpos (teleport) eval
-# ABS_JOINT_POS="--abs-joint-pos"
-ABS_JOINT_POS=""          # uncomment above for absolute joint pos (pd_joint_pos controller)
-# NO_PROPRIO="--no-proprio"
-NO_PROPRIO=""
-# TRAIN_SEEDS_ONLY="--train-seeds-only seeds/train_seeds.json"
-TRAIN_SEEDS_ONLY=""     # comment out above to use random seeds
+DIRECT_QPOS=""             # set to "--direct-qpos" for teleport mode
+ABS_JOINT_POS=""           # set to "--abs-joint-pos" for absolute position control
+NO_PROPRIO=""              # set to "--no-proprio" for vision-only
 
-# ============================================================================
-# 1. Fetch from remote
-# ============================================================================
+# Checkpoint override (leave empty to auto-pick latest epoch)
+CKPT_OVERRIDE=""
+# CKPT_OVERRIDE="checkpoints/epoch_20_train_mean_loss_0_000.ckpt"
+
+# 1. Fetch checkpoint from remote
+TASK_FOLDER=$(echo "${RUN_PATH}" | cut -d/ -f1)
+TASK_NAME=$(echo "${TASK_FOLDER}" | sed 's/^mikasa_//' \
+    | sed -E 's/_([a-z])/\U\1/g' \
+    | sed -E 's/_([0-9])/\1/g' \
+    | sed -E 's/^([a-z])/\U\1/')
+ENV_ID="${TASK_NAME}-v0"
+
 LOCAL_DIR="${LOCAL_PREFIX}/${RUN_PATH}"
 REMOTE_DIR="${REMOTE}:${REMOTE_PREFIX}/${RUN_PATH}/"
 
-echo "=== Fetching from remote ==="
-echo "  remote: ${REMOTE_DIR}"
-echo "  local:  ${LOCAL_DIR}"
+echo "Fetching from remote: ${REMOTE_DIR} -> ${LOCAL_DIR}"
 mkdir -p "${LOCAL_DIR}"
 rsync -rzvP "${REMOTE_DIR}" "${LOCAL_DIR}"
 
-# ============================================================================
-# 2. Checkpoint selection
-# ============================================================================
-# Hardcode a specific checkpoint (relative to LOCAL_DIR), or leave empty to auto-pick latest epoch.
-CKPT_OVERRIDE="checkpoints/epoch_20_train_mean_loss_0_000.ckpt"
-# CKPT_OVERRIDE=""
-
+# 2. Select checkpoint
 if [ -n "${CKPT_OVERRIDE}" ]; then
-    LATEST_CKPT="${LOCAL_DIR}/${CKPT_OVERRIDE}"
-    if [ ! -f "${LATEST_CKPT}" ]; then
-        echo "ERROR: hardcoded checkpoint not found: ${LATEST_CKPT}"
-        exit 1
-    fi
+    CKPT="${LOCAL_DIR}/${CKPT_OVERRIDE}"
+    [ -f "${CKPT}" ] || { echo "ERROR: checkpoint not found: ${CKPT}"; exit 1; }
 else
     CKPT_DIR="${LOCAL_DIR}/checkpoints"
-    if [ ! -d "${CKPT_DIR}" ]; then
-        echo "ERROR: no checkpoints dir at ${CKPT_DIR}"
-        exit 1
-    fi
-    LATEST_CKPT=$(ls "${CKPT_DIR}"/epoch_*.ckpt 2>/dev/null \
-        | sort -t/ -k1 -V \
-        | tail -1)
-    if [ -z "${LATEST_CKPT}" ]; then
-        echo "ERROR: no epoch_*.ckpt found in ${CKPT_DIR}"
-        exit 1
-    fi
+    [ -d "${CKPT_DIR}" ] || { echo "ERROR: no checkpoints dir at ${CKPT_DIR}"; exit 1; }
+    CKPT=$(ls "${CKPT_DIR}"/epoch_*.ckpt 2>/dev/null | sort -V | tail -1)
+    [ -n "${CKPT}" ] || { echo "ERROR: no epoch_*.ckpt found in ${CKPT_DIR}"; exit 1; }
 fi
-echo "=== Using checkpoint: ${LATEST_CKPT} ==="
+echo "Using checkpoint: ${CKPT}"
 
-# auto-derive output dir from task name, run name suffix, and epoch
-# e.g. 18-06-43_remember_shape_3_diffusion_memory_lr3e-4_state_only_mem_1step_include_hist_action
-#   -> state_only_mem_1step_include_hist_action (strip timestamp + task + diffusion_memory_lr*)
+# Build output dir from run suffix and epoch
 RUN_SUFFIX=$(basename "${RUN_PATH}" | sed -E 's/^[0-9-]+_[a-z]+_[a-z]+_[0-9]+_diffusion_memory_lr[^_]+_//')
-EPOCH=$(basename "${LATEST_CKPT}" | grep -oP 'epoch_\d+')  # e.g. epoch_6
+EPOCH=$(basename "${CKPT}" | grep -oP 'epoch_\d+')
 MODE=""
 [ -n "${DIRECT_QPOS}" ] && MODE="_dqpos"
 [ -n "${ABS_JOINT_POS}" ] && MODE="_absjpos"
-[ -n "${TRAIN_SEEDS_ONLY:-}" ] && MODE="${MODE}_trainseeds"
 OUTPUT_DIR="eval_results/${TASK_NAME}_${RUN_SUFFIX}_${EPOCH}${MODE}"
 
-# ============================================================================
 # 3. Run eval
-# ============================================================================
-echo "=== Running eval ==="
-echo "  checkpoint:  ${LATEST_CKPT}"
-echo "  env:         ${ENV_ID}"
-echo "  direct-qpos: ${DIRECT_QPOS:-off}"
-echo "  abs-jpos:    ${ABS_JOINT_POS:-off}"
-echo "  no-proprio:  ${NO_PROPRIO:-off}"
-echo "  num-envs:    ${NUM_ENVS}"
-echo "  eval-steps:  ${NUM_EVAL_STEPS}"
-echo "  output:      ${OUTPUT_DIR}"
-echo "  seed:        ${SEED}"
+echo "Running eval: ${ENV_ID} | ${NUM_ENVS} envs | ${NUM_EVAL_STEPS} steps | seed ${SEED}"
+echo "Output: ${OUTPUT_DIR}"
 
 conda run --no-capture-output -n mikasa python -u eval/mikasa_eval.py \
     --env-id "${ENV_ID}" \
-    --checkpoint "${LATEST_CKPT}" \
+    --checkpoint "${CKPT}" \
     ${DIRECT_QPOS:-} \
     ${ABS_JOINT_POS:-} \
     ${NO_PROPRIO:-} \
-    ${TRAIN_SEEDS_ONLY:-} \
     --num-envs "${NUM_ENVS}" \
     --num-eval-steps "${NUM_EVAL_STEPS}" \
     --output-dir "${OUTPUT_DIR}" \
     --seed "${SEED}"
 
-# ============================================================================
-# 4. Seed overlap analysis: in/out of training data vs success/failure
-# ============================================================================
-echo ""
-echo "=== Eval episodes saved to: ${OUTPUT_DIR}/${ENV_ID} ==="
-echo "=== Seed overlap analysis ==="
-python3 -u eval/seed_analysis.py "${OUTPUT_DIR}/${ENV_ID}" "seeds/train_seeds.json"
+echo "Done: ${OUTPUT_DIR}/${ENV_ID}"
