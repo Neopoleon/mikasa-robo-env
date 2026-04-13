@@ -138,11 +138,18 @@ def obs_to_policy_input(
     Output: two camera tensors (B,1,3,H,W) float [0,1], optional proprio (B,1,8),
             episode_idx (B,) for memory transformer history tracking.
     """
+    from kornia.geometry.transform import resize
+
     rgb = obs["rgb"]
     joints = obs["joints"]
 
+    # (B,1,3,H,W) float [0,1]; env renders at 128x128, policy expects 256x256
     third_person = rgb[..., :3].float().div_(255.0).permute(0, 3, 1, 2).unsqueeze(1)
     wrist_cam = rgb[..., 3:].float().div_(255.0).permute(0, 3, 1, 2).unsqueeze(1)
+
+    if third_person.shape[-1] != 256:
+        third_person = resize(third_person.squeeze(1), (256, 256), interpolation="bilinear").unsqueeze(1)
+        wrist_cam = resize(wrist_cam.squeeze(1), (256, 256), interpolation="bilinear").unsqueeze(1)
 
     result = {
         "third_person_camera": third_person.to(device),

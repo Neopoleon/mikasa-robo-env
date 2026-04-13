@@ -21,7 +21,6 @@ import torch
 from tqdm import tqdm
 
 from tasks import TASK_REGISTRY, make_eval_env, teleport_and_step, resolve_control_mode, compute_eval_steps
-from policy import ACTION_HORIZON, LocalPolicy, load_policy
 from recording import EpisodeBuffers, handle_episode_completions
 
 
@@ -179,6 +178,7 @@ def main():
     else:
         if args.checkpoint is None or args.env_id is None:
             raise ValueError("--checkpoint and --env-id are required without --remote-server")
+        from policy import ACTION_HORIZON, LocalPolicy, load_policy
         raw_policy, normalizer = load_policy(args.checkpoint, device)
         policy = LocalPolicy(raw_policy, normalizer, device,
                              action_horizon=ACTION_HORIZON, no_proprio=args.no_proprio)
